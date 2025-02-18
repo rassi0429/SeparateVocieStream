@@ -9,6 +9,58 @@ using System.Text;
 
 namespace SeparateVocieStream
 {
+    class InjectClass : IAudioUpdatable
+    {
+        World w;
+
+        public InjectClass(World w)
+        {
+            this.w = w;
+        }
+
+        public void InternalRunAudioConfigurationChanged()
+        {
+            // do nothing
+            // throw new System.NotImplementedException();
+        }
+
+        public void InternalRunAudioUpdate()
+        {
+            foreach (FrooxEngine.User user in w.AllUsers)
+            {
+                if (user.StreamGroupManager.Groups.Count == 0)
+                {
+                    Main.Msg("StreamGroupManager.Groups.Count == 0");
+                    continue;
+                }
+                OpusStream<MonoSample> opusStream = null;
+                // OpusStream があるか確認
+
+                user.Streams.ToList().ForEach(stream =>
+                {
+                    if (stream is OpusStream<MonoSample>)
+                    {
+                        opusStream = stream as OpusStream<MonoSample>;
+                    }
+                });
+
+                if (opusStream == null)
+                {
+                    Main.Msg("OpusStream is null");
+                    continue;
+                }
+
+                // opusstreamの音声を取得
+                if (opusStream.Samples == 0)
+                {
+                    return;
+                }
+
+                Main.CollectSamples(opusStream);
+            }
+        }
+    }
+
     public class Main : ResoniteMod
     {
         public override string Name => "SeparateVocieStream";
@@ -29,10 +81,31 @@ namespace SeparateVocieStream
                 Main.SaveWav("output.wav");
             };
 
+            FrooxEngine.Engine.Current.OnReady += () =>
+            {
+                Msg("Ready");
+
+            };
+            Engine.Current.RunPostInit(() =>
+            {
+                Msg("PostInit");
+
+                Engine.Current.WorldManager.WorldFocused += (FrooxEngine.World world) =>
+                {
+                    Msg("WorldFocused: " + world.Name);
+
+                    if(world.Name == "Local")
+                    {
+                        world.UpdateManager.RegisterForAudioUpdates((IAudioUpdatable)new InjectClass(world));
+                        return;
+                    }
+                };
+            });
+
         }
 
 
-        private static List<MonoSample> sampleBuffer = new List<MonoSample>();
+        private static List<float> sampleBuffer = new List<float>();
         // 前回取得したGlobalIndex
         private static long lastGlobalIndex = 0;
 
@@ -42,23 +115,26 @@ namespace SeparateVocieStream
                 return;
 
             long currentGlobalIndex = opusStream.GlobalIndex;
-            
-            long newSamplesCount = currentGlobalIndex - lastGlobalIndex;
+
+            if (currentGlobalIndex <= lastGlobalIndex)
+                return;
+
+            long newSamplesCount = 1024;
             if (newSamplesCount <= 0)
                 return;
 
-            MonoSample[] samples = new MonoSample[opusStream.Samples];
-            opusStream.Read<MonoSample>(samples);
+            float[] samples = new float[newSamplesCount];
+            opusStream.Read<MonoSample>(samples.AsMonoBuffer());
 
             Main.Msg("GlobalIndex: " + opusStream.GlobalIndex + " newSampleCount: " + newSamplesCount);
 
 
-            for (int i = 0; i < samples.Length; i++)
+            for (int i = 0; i < samples.Length ; i++)
             {
                 sampleBuffer.Add(samples[i]);
             }
 
-            lastGlobalIndex = lastGlobalIndex + newSamplesCount;
+            lastGlobalIndex = currentGlobalIndex;
         }
 
         public static void SaveWav(string filePath, int sampleRate = 44100, short bitsPerSample = 16, short channels = 1)
@@ -66,6 +142,23 @@ namespace SeparateVocieStream
             int byteRate = sampleRate * channels * bitsPerSample / 8;
             int dataSize = sampleBuffer.Count * channels * (bitsPerSample / 8);
             int riffChunkSize = 36 + dataSize;
+
+
+            using (var fs = new FileStream(filePath + ".txt", FileMode.Create))
+            using (var sw = new StreamWriter(fs))
+            {
+                sw.WriteLine("sampleBuffer.Count: " + sampleBuffer.Count);
+                sw.WriteLine("riffChunkSize: " + riffChunkSize);
+                sw.WriteLine("dataSize: " + dataSize);
+                for (int i = 0; i < sampleBuffer.Count;
+                    i++)
+                {
+                    sw.WriteLine(sampleBuffer[i]);
+                }
+
+                sw.Flush();
+                sw.Close();
+            }
 
             using (var fs = new FileStream(filePath, FileMode.Create))
             using (var bw = new BinaryWriter(fs))
@@ -92,68 +185,13 @@ namespace SeparateVocieStream
                 // サンプルデータを書き込む（amplitudeは-1.0～1.0の範囲と仮定）
                 foreach (var sample in sampleBuffer)
                 {
-                    short pcmValue = (short)(sample.amplitude * short.MaxValue);
+                    short pcmValue = (short)(sample * short.MaxValue);
                     bw.Write(pcmValue);
                 }
             }
 
             // 保存後にバッファをクリアする場合
             sampleBuffer.Clear();
-        }
-
-
-
-
-        [HarmonyPatch(typeof(FrooxEngine.Engine), "RunUpdateLoop")]
-        class Patch
-        {
-            static void Postfix(FrooxEngine.Engine __instance)
-            {
-                FrooxEngine.World w = __instance.WorldManager.FocusedWorld;
-
-                if(w == null)
-                {
-                    return;
-                }
-
-                foreach (FrooxEngine.User user in w.AllUsers)
-                {
-                    if(user.StreamGroupManager.Groups.Count == 0)
-                    {
-                        Msg("StreamGroupManager.Groups.Count == 0");
-                        continue;
-                    }
-                    OpusStream<MonoSample> opusStream = null;
-                    // OpusStream があるか確認
-
-                    user.Streams.ToList().ForEach(stream =>
-                    {
-                        if (stream is OpusStream<MonoSample>)
-                        {
-                            opusStream = stream as OpusStream<MonoSample>;
-                        }
-                    });
-
-                    if (opusStream == null)
-                    {
-                        Msg("OpusStream is null");
-                        continue;
-                    }
-
-                    // opusstreamの音声を取得
-                    if(opusStream.Samples == 0)
-                    {
-                        return;
-                    }
-
-                    Main.CollectSamples(opusStream);
-                    // MonoSample[] samples = new MonoSample[opusStream.Samples];
-                    // opusStream.Read<MonoSample>(samples);
-                    //Msg(samples[0].amplitude + " samples.Length: " + samples.Length + ", Last Index: " + opusStream.GlobalIndex);
-
-
-                }
-            }
         }
     }
 }
